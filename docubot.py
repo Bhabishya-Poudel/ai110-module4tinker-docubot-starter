@@ -9,6 +9,21 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import string
+import math
+
+# Words too common to count as evidence that a document answers the query
+STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "am",
+    "do", "does", "did", "i", "you", "we", "it", "this", "that", "these",
+    "those", "of", "to", "in", "on", "at", "for", "from", "with", "by",
+    "and", "or", "but", "not", "what", "where", "when", "which", "who",
+    "whom", "why", "how", "can", "could", "should", "would", "will",
+    "my", "your", "our", "me", "as", "if", "so", "than", "then", "there",
+}
+
+# Fraction of a query's meaningful words a document must contain to be used
+MIN_MATCH_RATIO = 0.6
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -64,7 +79,14 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for word in text.lower().split():
+                token = word.strip(string.punctuation)
+                if not token:
+                    continue
+                files = index.setdefault(token, [])
+                if filename not in files:
+                    files.append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +103,16 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        text_words = set(self.tokenize(text))
+        return sum(1 for word in set(self.tokenize(query)) if word in text_words)
+
+    def tokenize(self, text):
+        """
+        Lowercases, strips punctuation and drops stopwords, so common words
+        like "the" or "is" never count as evidence.
+        """
+        words = (w.strip(string.punctuation) for w in text.lower().split())
+        return [w for w in words if w and w not in STOPWORDS]
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,9 +121,57 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
+        # Guardrail 1: a query with no meaningful words has nothing to match
+        query_words = set(self.tokenize(query))
+        if not query_words:
+            return []
+
+        # Guardrail 2: a document must cover enough of the query's words
+        min_score = max(1, math.ceil(MIN_MATCH_RATIO * len(query_words)))
+
+        # Use the index to find candidate files containing any query word
+        candidates = set()
+        for word in query_words:
+            candidates.update(self.index.get(word, []))
+
         results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        for filename, text in self.documents:
+            if filename in candidates:
+                score = self.score_document(query, text)
+                if score >= min_score:
+                    results.append((score, filename, text))
+
+        results.sort(key=lambda r: r[0], reverse=True)
+
+        # Guardrail 3: the chosen paragraph must itself match enough words
+        snippets = []
+        for _, filename, text in results[:top_k]:
+            paragraph = self.best_paragraph(query, text)
+            if self.score_document(query, paragraph) >= min_score:
+                snippets.append((filename, paragraph))
+        return snippets
+
+    def best_paragraph(self, query, text):
+        """
+        Returns the single paragraph of text that best matches the query.
+        A heading line is kept together with the paragraph that follows it.
+        """
+        paragraphs = []
+        heading = ""
+        for block in text.split("\n\n"):
+            block = block.strip()
+            if not block:
+                continue
+            if block.startswith("#") and "\n" not in block:
+                heading = block + "\n"
+                continue
+            paragraphs.append(heading + block)
+            heading = ""
+        if heading:
+            paragraphs.append(heading.strip())
+        if not paragraphs:
+            return text
+        return max(paragraphs, key=lambda p: self.score_document(query, p))
 
     # -----------------------------------------------------------
     # Answering Modes
